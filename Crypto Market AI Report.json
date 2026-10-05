@@ -1,0 +1,303 @@
+{
+  "name": "Crypto Market AI Report",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "triggerAtHour": 7
+            }
+          ]
+        }
+      },
+      "id": "1c656a14-8465-4057-8acf-67cd8394f91e",
+      "name": "Schedule Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.4,
+      "position": [
+        0,
+        128
+      ]
+    },
+    {
+      "parameters": {
+        "url": "https://api.coinpaprika.com/v1/tickers",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "id": "0d468292-b6b7-41b9-8fd1-a1689675da86",
+      "name": "CoinPaprika",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        224,
+        224
+      ]
+    },
+    {
+      "parameters": {
+        "url": "https://api.alternative.me/fng/",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "limit",
+              "value": "7"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {}
+          }
+        }
+      },
+      "id": "d8fd65ce-79a9-46e4-88ae-f729d39867ae",
+      "name": "FearGreed",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        224,
+        32
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "32f66986-d9b8-4b61-a667-abfb0c6fd5af",
+      "name": "Merge",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.2,
+      "position": [
+        448,
+        128
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "/**\n * crypto-agent-prompt.js\n *\n * Uzima sirove podatke (Fear & Greed Index + CoinPaprika /tickers lista) i pravi\n * kompaktnu poruku koju AI agent može da pročita i na osnovu nje procijeni\n * gdje ima potencijala, a gdje je rizično.\n *\n * Radi na dva načina:\n *   1) n8n \"Code\" node (Run Once for All Items) – samo zalijepi cijeli fajl.\n *      Izlaz: [{ json: { message, summary } }]  -> u AI Agent node koristi polje $json.message\n *   2) Node.js iz terminala:\n *      node crypto-agent-prompt.js podaci.json            -> ispiše poruku\n *      node crypto-agent-prompt.js podaci.json --json     -> ispiše { message, summary }\n */\n\n// ───────────────────────────── PODEŠAVANJA ─────────────────────────────\nconst CONFIG = {\n  minMarketCap: 50_000_000,   // ispod ovoga coin se ignoriše (previše mali / manipulisan)\n  minVolume24h: 1_000_000,    // ispod ovoga nema dovoljno likvidnosti\n  liquidMarketCap: 100_000_000, // za liste \"lideri/gubitnici\" traži bar ovoliko...\n  liquidVolume24h: 5_000_000,   // ...i bar ovoliki dnevni promet\n  topByCap: 15,\n  topMovers: 10,\n  topVolumeSpikes: 8,\n  topCandidates: 10,\n  topRedFlags: 10,\n  stableDepegPct: 1.0,        // stablecoin van ±1% od $1 = upozorenje\n};\n\n// Poznati stablecoini i \"omotani\"/staking derivati (duplikati BTC/ETH)\nconst STABLE_SYMBOLS = new Set([\n  'USDT', 'USDC', 'DAI', 'USDS', 'SUSDS', 'USDE', 'SUSDE', 'USD1', 'FDUSD', 'TUSD', 'PYUSD',\n  'USDD', 'FRAX', 'LUSD', 'GUSD', 'USDP', 'BUSD', 'RLUSD', 'USDX', 'USDG', 'USD0', 'EURC',\n  'EURS', 'USTC', 'CRVUSD', 'GHO', 'USDB', 'USDY', 'BFUSD', 'USDF', 'USDTB', 'SYRUPUSDC',\n]);\nconst WRAPPED_SYMBOLS = new Set([\n  'WBTC', 'CBBTC', 'TBTC', 'LBTC', 'SOLVBTC', 'BTCB', 'WETH', 'STETH', 'WSTETH', 'WEETH',\n  'RETH', 'CBETH', 'METH', 'EZETH', 'RSETH', 'OSETH', 'ETHX', 'SFRXETH', 'WBETH', 'JITOSOL',\n  'MSOL', 'BNSOL', 'JUPSOL', 'STSOL', 'SAVAX', 'WTRX', 'WBNB', 'STHYPE', 'KHYPE',\n]);\n\n// ───────────────────────────── POMOĆNE ─────────────────────────────\nconst num = (v) => (v === null || v === undefined || v === '' || isNaN(Number(v)) ? null : Number(v));\nconst round = (v, d = 2) => (v === null ? null : Math.round(v * 10 ** d) / 10 ** d);\nconst median = (arr) => {\n  const a = arr.filter((x) => x !== null).sort((x, y) => x - y);\n  if (!a.length) return null;\n  const m = Math.floor(a.length / 2);\n  return a.length % 2 ? a[m] : (a[m - 1] + a[m]) / 2;\n};\nconst pct = (v) => (v === null ? 'n/a' : `${v > 0 ? '+' : ''}${v.toFixed(1)}%`);\nconst usd = (v) => {\n  if (v === null) return 'n/a';\n  const a = Math.abs(v);\n  if (a >= 1e12) return `$${(v / 1e12).toFixed(2)}T`;\n  if (a >= 1e9) return `$${(v / 1e9).toFixed(2)}B`;\n  if (a >= 1e6) return `$${(v / 1e6).toFixed(1)}M`;\n  if (a >= 1e3) return `$${(v / 1e3).toFixed(1)}K`;\n  return `$${v.toFixed(0)}`;\n};\nconst price = (v) => {\n  if (v === null) return 'n/a';\n  if (v >= 1000) return `$${v.toFixed(0)}`;\n  if (v >= 1) return `$${v.toFixed(2)}`;\n  return `$${Number(v.toPrecision(3))}`; // npr. $0.0000123 umjesto $0.00\n};\n\n// ───────────────────────────── 1. IZVLAČENJE PODATAKA ─────────────────────────────\n// Prima bilo šta (niz, n8n item-e, ugniježđene nizove) i razdvaja F&G od coina.\nfunction extract(input) {\n  const out = { fng: null, coins: [] };\n  const walk = (node) => {\n    if (Array.isArray(node)) return node.forEach(walk);\n    if (!node || typeof node !== 'object') return;\n    if (node.json && typeof node.json === 'object') return walk(node.json); // n8n item\n    if (Array.isArray(node.data) && node.data[0] && 'value_classification' in node.data[0]) {\n      out.fng = node.data;\n      return;\n    }\n    if (node.quotes && node.quotes.USD) {\n      out.coins.push(node);\n      return;\n    }\n    if (Array.isArray(node.data)) walk(node.data); // npr. { data: [...] } omotač\n  };\n  walk(input);\n  return out;\n}\n\n// ───────────────────────────── 2. NORMALIZACIJA + SKOROVI ─────────────────────────────\nfunction normalizeCoin(c) {\n  const q = c.quotes.USD;\n  const mcap = num(q.market_cap) || 0;\n  const vol = num(q.volume_24h) || 0;\n  const ageYears = c.first_data_at ? (Date.now() - new Date(c.first_data_at).getTime()) / 3.15576e10 : null;\n  return {\n    rank: c.rank,\n    symbol: String(c.symbol || '').trim().toUpperCase(),\n    name: c.name,\n    price: num(q.price),\n    mcap,\n    vol,\n    volToCap: mcap > 0 ? vol / mcap : null,\n    volChange24h: num(q.volume_24h_change_24h),\n    ch1h: num(q.percent_change_1h),\n    ch6h: num(q.percent_change_6h),\n    ch24h: num(q.percent_change_24h),\n    ch7d: num(q.percent_change_7d),\n    fromAth: num(q.percent_from_price_ath),\n    athDate: q.ath_date ? q.ath_date.slice(0, 10) : null,\n    beta: num(c.beta_value),\n    ageYears,\n    totalSupply: num(c.total_supply),\n    maxSupply: num(c.max_supply) || null,\n  };\n}\n\nfunction isStable(c) {\n  if (STABLE_SYMBOLS.has(c.symbol)) return true;\n  // heuristika: cijena ~1$ + skoro nulta beta + mali pomaci\n  return c.price !== null && Math.abs(c.price - 1) < 0.02 && c.beta !== null && Math.abs(c.beta) < 0.05\n    && Math.abs(c.ch7d || 0) < 1;\n}\n\nfunction isWrapped(c, btc, eth) {\n  if (WRAPPED_SYMBOLS.has(c.symbol)) return true;\n  // heuristika: kreće se identično kao BTC ili ETH (ista beta i isti 7d pomak)\n  return [btc, eth].some((p) => p && p.symbol !== c.symbol && c.beta !== null && p.beta !== null\n    && Math.abs(c.beta - p.beta) < 0.01 && Math.abs((c.ch7d || 0) - (p.ch7d || 0)) < 0.3\n    && Math.abs((c.ch24h || 0) - (p.ch24h || 0)) < 0.3);\n}\n\n// Rizik 0–100 (veće = rizičnije). Namjerno jednostavno i objašnjivo.\nfunction riskScore(c) {\n  let r = 0;\n  const flags = [];\n  if (c.mcap < 200e6) { r += 22; flags.push('mali cap'); }\n  else if (c.mcap < 1e9) r += 14;\n  else if (c.mcap < 10e9) r += 6;\n\n  if (c.vol < 5e6) { r += 12; flags.push('nizak promet'); }\n  if (c.volToCap !== null) {\n    if (c.volToCap < 0.005) { r += 10; flags.push('nelikvidan'); }\n    else if (c.volToCap > 1) { r += 18; flags.push('promet>cap (pump/wash?)'); }\n    else if (c.volToCap > 0.3) { r += 8; flags.push('pregrijan promet'); }\n  }\n  const a24 = Math.abs(c.ch24h || 0);\n  const a7 = Math.abs(c.ch7d || 0);\n  if (a24 > 15) { r += 14; flags.push('24h ekstremno'); } else if (a24 > 7) r += 7;\n  if (a7 > 40) { r += 14; flags.push('7d ekstremno'); } else if (a7 > 20) r += 7;\n\n  if (c.beta !== null) { if (c.beta > 1.6) r += 8; else if (c.beta > 1.3) r += 4; }\n  if (c.fromAth !== null && c.fromAth < -90) { r += 8; flags.push('-90% od ATH'); }\n  if (c.ageYears !== null) {\n    if (c.ageYears < 1) { r += 10; flags.push('mlađi od 1g'); } else if (c.ageYears < 2) r += 5;\n  }\n  if (c.volChange24h !== null && c.volChange24h > 300) flags.push(`promet +${Math.round(c.volChange24h)}%`);\n\n  r = Math.min(100, r);\n  const level = r < 25 ? 'nizak' : r < 45 ? 'umjeren' : r < 65 ? 'visok' : 'vrlo visok';\n  return { risk: r, riskLevel: level, flags };\n}\n\n// Momentum: težinski zbir kratkih i srednjih pomaka + odnos prema BTC-u\nfunction momentumScore(c, btc) {\n  const m = 0.55 * (c.ch7d || 0) + 0.3 * (c.ch24h || 0) + 0.15 * (c.ch6h || 0);\n  const vsBtc7d = btc ? (c.ch7d || 0) - (btc.ch7d || 0) : null;\n  return { momentum: round(m, 2), vsBtc7d: round(vsBtc7d, 2) };\n}\n\n// ───────────────────────────── 3. ANALIZA ─────────────────────────────\nfunction analyze(raw) {\n  const { fng, coins } = extract(raw);\n  const all = coins.map(normalizeCoin).filter((c) => c.price !== null);\n  const btc = all.find((c) => c.symbol === 'BTC');\n  const eth = all.find((c) => c.symbol === 'ETH');\n\n  const stables = [], wrapped = [], tooSmall = [], eligible = [];\n  const seen = new Set(); // isti simbol više puta (bridged kopije) -> zadrži onaj sa najvećim capom\n  for (const c of [...all].sort((x, y) => y.mcap - x.mcap)) {\n    const dup = seen.has(c.symbol);\n    seen.add(c.symbol);\n    if (isStable(c)) stables.push(c);\n    else if (dup || isWrapped(c, btc, eth)) wrapped.push(c);\n    else if (c.mcap < CONFIG.minMarketCap || c.vol < CONFIG.minVolume24h) tooSmall.push(c);\n    else eligible.push(Object.assign(c, riskScore(c), momentumScore(c, btc)));\n  }\n  const liquid = eligible.filter((c) => c.mcap >= CONFIG.liquidMarketCap && c.vol >= CONFIG.liquidVolume24h);\n\n  // Sentiment\n  let sentiment = null;\n  if (fng && fng.length) {\n    const vals = fng.map((d) => ({ v: num(d.value), cls: d.value_classification, t: num(d.timestamp) }))\n      .filter((d) => d.v !== null).sort((a, b) => b.t - a.t);\n    const avg = vals.reduce((s, d) => s + d.v, 0) / vals.length;\n    const oldest = vals[vals.length - 1];\n    sentiment = {\n      now: vals[0].v, label: vals[0].cls, avg: round(avg, 1),\n      change: vals[0].v - oldest.v, days: vals.length,\n      min: Math.min(...vals.map((d) => d.v)), max: Math.max(...vals.map((d) => d.v)),\n      series: vals.map((d) => d.v).reverse(),\n    };\n  }\n\n  // Širina tržišta (breadth) – na kvalifikovanim coinima\n  const totalCap = all.reduce((s, c) => s + c.mcap, 0);\n  const capWeighted = (key) => {\n    const w = eligible.reduce((s, c) => s + c.mcap, 0);\n    return w ? eligible.reduce((s, c) => s + c.mcap * (c[key] || 0), 0) / w : null;\n  };\n  const breadth = {\n    universe: all.length,\n    eligible: eligible.length,\n    excluded: { stables: stables.length, wrapped: wrapped.length, tooSmallOrIlliquid: tooSmall.length },\n    up24hPct: round(100 * eligible.filter((c) => c.ch24h > 0).length / (eligible.length || 1), 1),\n    up7dPct: round(100 * eligible.filter((c) => c.ch7d > 0).length / (eligible.length || 1), 1),\n    beatBtc7dPct: round(100 * eligible.filter((c) => c.vsBtc7d > 0).length / (eligible.length || 1), 1),\n    median24h: round(median(eligible.map((c) => c.ch24h)), 2),\n    median7d: round(median(eligible.map((c) => c.ch7d)), 2),\n    capWeighted24h: round(capWeighted('ch24h'), 2),\n    capWeighted7d: round(capWeighted('ch7d'), 2),\n    totalCap,\n    btcDominance: btc ? round(100 * btc.mcap / totalCap, 1) : null,\n    ethDominance: eth ? round(100 * eth.mcap / totalCap, 1) : null,\n    stableShare: round(100 * stables.reduce((s, c) => s + c.mcap, 0) / totalCap, 1),\n  };\n\n  const by = (key, dir = -1) => (a, b) => dir * ((a[key] ?? -Infinity) - (b[key] ?? -Infinity));\n\n  const lists = {\n    topByCap: [...eligible].sort(by('mcap')).slice(0, CONFIG.topByCap),\n    leaders7d: [...liquid].sort(by('ch7d')).slice(0, CONFIG.topMovers),\n    laggards7d: [...liquid].sort(by('ch7d', 1)).slice(0, CONFIG.topMovers),\n    volumeSpikes: liquid.filter((c) => c.volChange24h > 100).sort(by('volChange24h')).slice(0, CONFIG.topVolumeSpikes),\n    // Kandidati: umjeren rizik, pozitivan trend, bolji od BTC-a, bez pregrijavanja\n    candidates: liquid.filter((c) => c.risk < 45 && c.ch7d > 0 && c.ch24h > -3 && c.vsBtc7d > 0 && c.ch7d < 35)\n      .sort(by('momentum')).slice(0, CONFIG.topCandidates),\n    // Crvene zastavice: visok rizik + značajan promet (da nisu potpuno nebitni)\n    redFlags: eligible.filter((c) => c.risk >= 55).sort((a, b) => b.risk - a.risk || b.mcap - a.mcap)\n      .slice(0, CONFIG.topRedFlags),\n    depegs: stables.filter((c) => c.mcap > 100e6 && Math.abs(c.price - 1) * 100 > CONFIG.stableDepegPct\n      && !['SUSDS', 'SUSDE', 'EURC', 'EURS', 'SYRUPUSDC'].includes(c.symbol)),\n  };\n\n  return { generatedAt: new Date().toISOString(), dataTime: coins[0]?.last_updated || null,\n    sentiment, btc, eth, breadth, lists };\n}\n\n// ───────────────────────────── 4. PORUKA ZA AGENTA ─────────────────────────────\nfunction row(c) {\n  return [c.symbol, price(c.price), usd(c.mcap), `v/c ${c.volToCap.toFixed(3)}`, `24h ${pct(c.ch24h)}`,\n    `7d ${pct(c.ch7d)}`, `vsBTC ${pct(c.vsBtc7d)}`, `ATH ${pct(c.fromAth)}`, `β ${c.beta?.toFixed(2) ?? 'n/a'}`,\n    `rizik ${c.risk} (${c.riskLevel})`].join(' | ') + (c.flags.length ? ` | ⚠ ${c.flags.join(', ')}` : '');\n}\n\nfunction buildMessage(a) {\n  const L = [];\n  const b = a.breadth;\n  L.push(`# KRIPTO TRŽIŠTE – SNAPSHOT (${a.dataTime || a.generatedAt})`);\n  L.push('');\n  L.push('## Napomene o podacima');\n  L.push(`- Analizirano ${b.universe} coina; kvalifikovano ${b.eligible} (isključeno: ${b.excluded.stables} stablecoina, `\n    + `${b.excluded.wrapped} wrapped/staking derivata ili duplih simbola, ${b.excluded.tooSmallOrIlliquid} premalih/nelikvidnih: cap < ${usd(CONFIG.minMarketCap)} ili promet < ${usd(CONFIG.minVolume24h)}).`);\n  L.push('- Izvor ne daje 30d i 1y promjene (sve su 0) – NE koristi ih. Dostupni horizonti: 1h, 6h, 24h, 7d i udaljenost od ATH.');\n  L.push('- \"v/c\" = 24h promet / market cap. <0.005 nelikvidno, 0.02–0.15 zdravo, >0.3 pregrijano, >1 sumnjivo (pump/wash trading).');\n  L.push('- \"vsBTC\" = 7d promjena minus 7d promjena BTC-a (relativna snaga). \"β\" = beta prema tržištu.');\n  L.push('- \"rizik\" = 0–100 heuristika (veličina, likvidnost, volatilnost, beta, pad od ATH, starost projekta). Nije garancija.');\n  L.push('');\n\n  if (a.sentiment) {\n    const s = a.sentiment;\n    L.push('## Sentiment (Fear & Greed Index)');\n    L.push(`- Sada: ${s.now} (${s.label}); prosjek ${s.days} dana: ${s.avg}; raspon ${s.min}–${s.max}; promjena u periodu: ${s.change > 0 ? '+' : ''}${s.change}.`);\n    L.push(`- Serija (najstarije → najnovije): ${s.series.join(', ')}`);\n    L.push(`- Tumačenje: ${s.now >= 75 ? 'ekstremna pohlepa – povećan rizik korekcije' : s.now >= 55 ? 'pohlepa – tržište optimistično, oprez sa jurenjem rasta'\n      : s.now > 45 ? 'neutralno' : s.now > 25 ? 'strah – moguće prilike, ali trend slab' : 'ekstreman strah – istorijski zona akumulacije, visoka volatilnost'}.`);\n    L.push('');\n  }\n\n  L.push('## Širina tržišta');\n  if (a.btc) L.push(`- BTC: ${price(a.btc.price)} | 24h ${pct(a.btc.ch24h)} | 7d ${pct(a.btc.ch7d)} | od ATH ${pct(a.btc.fromAth)} (ATH ${a.btc.athDate})`);\n  if (a.eth) L.push(`- ETH: ${price(a.eth.price)} | 24h ${pct(a.eth.ch24h)} | 7d ${pct(a.eth.ch7d)} | od ATH ${pct(a.eth.fromAth)} (ATH ${a.eth.athDate})`);\n  L.push(`- Ukupni cap (praćeni coini): ${usd(b.totalCap)} | BTC dominacija ${b.btcDominance}% | ETH ${b.ethDominance}% | stablecoini ${b.stableShare}%`);\n  L.push(`- U plusu 24h: ${b.up24hPct}% coina | u plusu 7d: ${b.up7dPct}% | bolji od BTC-a 7d: ${b.beatBtc7dPct}%`);\n  L.push(`- Medijana: 24h ${pct(b.median24h)}, 7d ${pct(b.median7d)} | ponderisano capom: 24h ${pct(b.capWeighted24h)}, 7d ${pct(b.capWeighted7d)}`);\n  L.push('');\n\n  const section = (title, list, note) => {\n    L.push(`## ${title}`);\n    if (note) L.push(`_${note}_`);\n    if (!list.length) L.push('- (nema)');\n    list.forEach((c) => L.push(`- ${row(c)}`));\n    L.push('');\n  };\n  section(`Top ${CONFIG.topByCap} po market capu (bez stablecoina i derivata)`, a.lists.topByCap);\n  section('Kandidati – pozitivan trend uz umjeren rizik', a.lists.candidates,\n    'rizik < 45, 7d > 0 i bolji od BTC-a, 24h > -3%, 7d < +35% (nije pregrijan), cap ≥ $100M, promet ≥ $5M');\n  section('Najjači 7d (likvidni)', a.lists.leaders7d);\n  section('Najslabiji 7d (likvidni)', a.lists.laggards7d);\n  section('Skok prometa 24h (moguća vijest/događaj)', a.lists.volumeSpikes, 'promet porastao >100% za 24h');\n  section('Crvene zastavice – visok rizik', a.lists.redFlags);\n  if (a.lists.depegs.length) {\n    L.push('## ⚠ Stablecoini van pariteta');\n    a.lists.depegs.forEach((c) => L.push(`- ${c.symbol}: ${price(c.price)} (cap ${usd(c.mcap)})`));\n    L.push('');\n  }\n\n  L.push('## Zadatak');\n  L.push('Na osnovu ovih podataka: (1) procijeni opšte stanje tržišta i sentiment, (2) predloži raspodjelu kapitala po '\n    + 'kategorijama rizika (npr. % u BTC/ETH, % u kandidate, % u stablecoinima), (3) navedi konkretne coine koje vrijedi '\n    + 'pratiti i zašto, (4) navedi šta izbjegavati i zašto, (5) navedi glavne rizike i šta bi promijenilo procjenu. '\n    + 'Oslanjaj se samo na brojke iznad; ako nešto ne možeš zaključiti iz podataka, reci to.');\n  return L.join('\\n');\n}\n\n// ───────────────────────────── 5. POKRETANJE ─────────────────────────────\nfunction run(raw) {\n  const analysis = analyze(raw);\n  const message = buildMessage(analysis);\n  // summary = strukturirani podaci, ako agentu želiš dati i JSON (skraćeno)\n  const slim = (c) => ({ symbol: c.symbol, price: c.price, mcap: c.mcap, ch24h: c.ch24h, ch7d: c.ch7d,\n    vsBtc7d: c.vsBtc7d, volToCap: round(c.volToCap, 4), fromAth: c.fromAth, risk: c.risk, flags: c.flags });\n  const summary = { ...analysis, btc: undefined, eth: undefined,\n    lists: Object.fromEntries(Object.entries(analysis.lists).map(([k, v]) => [k, v.map(slim)])) };\n  return { message, summary };\n}\n\n// n8n Code node\nif (typeof $input !== 'undefined') {\n  return [{ json: run($input.all().map((i) => i.json)) }];\n}\n\n// Node.js CLI\nif (typeof require !== 'undefined' && typeof module !== 'undefined' && require.main === module) {\n  const fs = require('fs');\n  const file = process.argv[2];\n  if (!file) { console.error('Upotreba: node crypto-agent-prompt.js podaci.json [--json]'); process.exit(1); }\n  const result = run(JSON.parse(fs.readFileSync(file, 'utf8')));\n  console.log(process.argv.includes('--json') ? JSON.stringify(result, null, 2) : result.message);\n}\n\nif (typeof module !== 'undefined') module.exports = { run, analyze, buildMessage, CONFIG };"
+      },
+      "id": "67247ef4-8f8d-49df-93cd-ad64bccc39a3",
+      "name": "Code in JavaScript",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        672,
+        128
+      ]
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "={{ $json.message }}{{ $json.summary }}\n\nNa osnovu ovog Jsona, daj mi poruku sta da radim, koji su rizici a koji su moguci dobiti",
+        "options": {
+          "systemMessage": "Ti si iskusan kripto analiticar. Odgovaraj jasno i sazeto, oslanjaj se samo na dostavljene podatke i naglasi da analiza nije finansijski savjet."
+        }
+      },
+      "id": "c749098d-8500-48de-bec5-aac94034ad6b",
+      "name": "AI Agent",
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 3.1,
+      "position": [
+        896,
+        128
+      ]
+    },
+    {
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "value": "claude-sonnet-5-5",
+          "mode": "list",
+          "cachedResultName": "Claude Sonnet 5.5"
+        },
+        "options": {}
+      },
+      "id": "f51d422a-fa70-4518-b59c-21635aff6d80",
+      "name": "Anthropic Chat Model",
+      "type": "@n8n/n8n-nodes-langchain.lmChatAnthropic",
+      "typeVersion": 1.6,
+      "position": [
+        976,
+        352
+      ],
+      "credentials": {
+        "anthropicApi": {
+          "id": null,
+          "name": "",
+          "__aiGatewayManaged": true
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const LIMIT = 4000;\nconst out = [];\nfor (const item of $input.all()) {\n  const text = String(item.json.output || '');\n  const lines = text.split('\\n');\n  let chunk = '';\n  for (let line of lines) {\n    while (line.length > LIMIT) {\n      if (chunk) { out.push(chunk); chunk = ''; }\n      out.push(line.slice(0, LIMIT));\n      line = line.slice(LIMIT);\n    }\n    const next = chunk ? chunk + '\\n' + line : line;\n    if (next.length > LIMIT) { out.push(chunk); chunk = line; } else { chunk = next; }\n  }\n  if (chunk.trim()) out.push(chunk);\n}\nreturn out.map(text => ({ json: { text } }));"
+      },
+      "id": "4230e419-29c5-4c9c-a4a6-e5a1916e11d6",
+      "name": "Split for Telegram",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1280,
+        320
+      ]
+    },
+    {
+      "parameters": {
+        "chatId": "@aiwithtrade",
+        "text": "={{ $json.text }}",
+        "additionalFields": {}
+      },
+      "id": "53ffe4b2-00f2-4be1-b31f-e916038e366c",
+      "name": "Send a text message",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1280,
+        112
+      ],
+      "webhookId": "74248719-9f37-4c9c-a88e-f7dc505829f7",
+      "credentials": {
+        "telegramApi": {
+          "id": "ZO6vnE2ooHcspJ16",
+          "name": "Telegram account"
+        }
+      }
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Schedule Trigger": {
+      "main": [
+        [
+          {
+            "node": "CoinPaprika",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "FearGreed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "CoinPaprika": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "FearGreed": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge": {
+      "main": [
+        [
+          {
+            "node": "Code in JavaScript",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code in JavaScript": {
+      "main": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Agent": {
+      "main": [
+        [
+          {
+            "node": "Split for Telegram",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Anthropic Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Split for Telegram": {
+      "main": [
+        [
+          {
+            "node": "Send a text message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "ffd822e4-9aef-432e-8472-5952d7a36d04",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "0f2324c39953676d3c3490090391195fd399625d1615e6b50e699a8f1fc20042"
+  },
+  "nodeGroups": [
+    {
+      "id": "691432b0-2ea2-48bc-85c8-e75b1b555e8a",
+      "name": "Build market snapshot",
+      "nodeIds": [
+        "32f66986-d9b8-4b61-a667-abfb0c6fd5af",
+        "67247ef4-8f8d-49df-93cd-ad64bccc39a3"
+      ],
+      "description": "Combines sentiment and coin prices into one scored market summary and prompt"
+    },
+    {
+      "id": "b86bd051-a981-45bc-9be1-9ed2ef314a07",
+      "name": "Deliver AI report",
+      "nodeIds": [
+        "c749098d-8500-48de-bec5-aac94034ad6b",
+        "f51d422a-fa70-4518-b59c-21635aff6d80",
+        "4230e419-29c5-4c9c-a4a6-e5a1916e11d6",
+        "53ffe4b2-00f2-4be1-b31f-e916038e366c"
+      ],
+      "description": "Writes the advice, splits it into Telegram-sized parts and posts them to the channel"
+    }
+  ],
+  "id": "XAeZqW0s8EWov1KR",
+  "tags": []
+}
